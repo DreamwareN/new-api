@@ -1,6 +1,8 @@
 package openai
 
 import (
+	"bytes"
+	"encoding/json"
 	"fmt"
 	"io"
 	"net/http"
@@ -19,9 +21,94 @@ import (
 	"github.com/gin-gonic/gin"
 )
 
+// sanitizeOpenAIStreamChunk removes junk fields that some upstreams emit on
+// every chunk (finish_reason:"", tool_calls:[], function_call:null), which AI
+// SDK clients parse as extra reasoning/tool-call steps. Unknown fields and
+// real tool call payloads are kept as raw JSON bytes, so their formatting is
+// never touched; the chunk is only re-serialized when something was removed.
+func sanitizeOpenAIStreamChunk(data string) (string, bool) {
+	var top map[string]json.RawMessage
+	if err := common.UnmarshalJsonStr(data, &top); err != nil {
+		return data, false
+	}
+	choicesRaw, ok := top["choices"]
+	if !ok {
+		return data, false
+	}
+	var choices []map[string]json.RawMessage
+	if err := common.Unmarshal(choicesRaw, &choices); err != nil {
+		return data, false
+	}
+	changed := false
+	for i := range choices {
+		choice := choices[i]
+		if fr, ok := choice["finish_reason"]; ok {
+			trimmed := bytes.TrimSpace(fr)
+			var frStr string
+			if bytes.Equal(trimmed, []byte("null")) || (common.Unmarshal(trimmed, &frStr) == nil && frStr == "") {
+				delete(choice, "finish_reason")
+				changed = true
+			}
+		}
+		deltaRaw, ok := choice["delta"]
+		if !ok {
+			continue
+		}
+		var delta map[string]json.RawMessage
+		if err := common.Unmarshal(deltaRaw, &delta); err != nil {
+			continue
+		}
+		deltaChanged := false
+		if tc, ok := delta["tool_calls"]; ok {
+			trimmed := bytes.TrimSpace(tc)
+			empty := bytes.Equal(trimmed, []byte("null"))
+			if !empty && len(trimmed) > 0 && trimmed[0] == '[' {
+				var calls []json.RawMessage
+				if err := common.Unmarshal(trimmed, &calls); err == nil && len(calls) == 0 {
+					empty = true
+				}
+			}
+			if empty {
+				delete(delta, "tool_calls")
+				deltaChanged = true
+			}
+		}
+		if fc, ok := delta["function_call"]; ok && bytes.Equal(bytes.TrimSpace(fc), []byte("null")) {
+			delete(delta, "function_call")
+			deltaChanged = true
+		}
+		if !deltaChanged {
+			continue
+		}
+		newDelta, err := common.Marshal(delta)
+		if err != nil {
+			continue
+		}
+		choice["delta"] = newDelta
+		changed = true
+	}
+	if !changed {
+		return data, false
+	}
+	newChoices, err := common.Marshal(choices)
+	if err != nil {
+		return data, false
+	}
+	top["choices"] = newChoices
+	out, err := common.Marshal(top)
+	if err != nil {
+		return data, false
+	}
+	return string(out), true
+}
+
 func sendStreamData(c *gin.Context, info *relaycommon.RelayInfo, data string, forceFormat bool, thinkToContent bool) error {
 	if data == "" {
 		return nil
+	}
+
+	if sanitized, changed := sanitizeOpenAIStreamChunk(data); changed {
+		data = sanitized
 	}
 
 	if !forceFormat && !thinkToContent {
